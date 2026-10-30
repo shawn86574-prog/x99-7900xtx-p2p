@@ -53,7 +53,7 @@ off makes RCCL try P2P and fail. Either can be rolled back alone.
 ## Quick start
 
 ```bash
-git clone https://github.com/shawn86574/x99-7900xtx-p2p.git && cd x99-7900xtx-p2p
+git clone https://github.com/shawn86574-prog/x99-7900xtx-p2p.git && cd x99-7900xtx-p2p
 sudo bash kernel/install-p2p-kernel.sh --dkms   # build + DKMS + softdep + install topology
 sudo reboot                                     # amdgpu must re-probe with the hook in place
 bash scripts/p2p-preflight.sh                   # must print isAllDirectP2p 1 and via P2P/IPC
