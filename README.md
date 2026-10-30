@@ -6,6 +6,14 @@ plus one fake topology XML. Measured RCCL busbw goes from **3.96–4.14 GB/s (SH
 5.03 GB/s (P2P/IPC)**, and a 1920×1088 / 124-frame / 4-step video pipeline drops from
 88.91 s to 85.00 s per step.
 
+> **Scope: genuine Intel X99 / C610 boards only.** The kretprobe replaces the kernel's
+> chipset whitelist decision, so the advertised host-bridge ID does not matter — but the
+> firmware does. Clone "X99" boards (Huananzhi, JGINYUE, Maxsun and similar) typically ship
+> with missing or broken VT-d, no Above-4G/ReBAR support, and ACS left on, so at least one of
+> the gates in [Requirements](#requirements-and-compatibility) fails. This repo offers no
+> clone-board mode; forcing peer mappings on firmware without working IOMMU translation can
+> corrupt memory silently. Details in [Genuine X99 / C610 only](#genuine-x99--c610-only).
+
 ## Motivation
 
 An X99 board (`8086:6f00`) is not in the kernel's `pci_p2pdma_whitelist`, so
@@ -69,6 +77,38 @@ All of these are hard prerequisites. `scripts/p2p-preflight.sh` checks every one
 Verified fingerprint of this machine: `7.0.0-38-generic`, `CONFIG_KRETPROBES=y`,
 torch `2.13.0+rocm7.2`, RCCL `2.27.7`, two `1002:744c` at `05:00.0` / `08:00.0`,
 both inside IOMMU groups.
+
+### Genuine X99 / C610 only
+
+The patch does not depend on the host-bridge ID in `pci_p2pdma_whitelist` — it replaces that
+decision. What it cannot replace is firmware. Retail X99 boards (ASUS, Gigabyte, ASRock, MSI
+C610/Wellsburg designs) provide the four properties below; most reworked "X99" clone boards
+do not, and then the method is not just unsupported but unsafe.
+
+| Firmware property | Retail X99 | Clone board (typical) | Consequence when missing |
+|---|---|---|---|
+| Valid DMAR/ACPI table, VT-d functional | yes | absent, disabled, or non-functional | no IOMMU translation → the 32 GB BAR at `0x383000000000` is unreachable |
+| Above 4G Decoding + ReBAR implemented | yes | absent, or cosmetic only | BAR stays below 4 GiB or is limited to 256 MB; peer mapping fails or collapses |
+| ACS not enabled on root ports / switches | yes | often enabled and hidden from setup | traffic is redirected through the root complex; no direct PXB path |
+| Setup permits Secure Boot off / ASPM off | yes | sometimes locked or missing | unsigned module refused, or link stalls during long collectives |
+
+A further mismatch is wiring, not firmware: clone boards often route the slots through
+different switches or with x4 links. `scripts/gen-topo.sh` fixes BDFs and gfx IDs, but it
+cannot turn x4 wiring into x16 — expect proportionally lower bandwidth even when P2P works.
+
+Stop before installing if any of these is true:
+
+```bash
+journalctl -k -b | grep 'DMAR: Host address width'      # empty -> no VT-d, stop
+ls /sys/kernel/iommu_groups | wc -l                     # 0 -> IOMMU not active, stop
+lspci -vv -s 05:00.0 | grep 'Region 0'                  # not 64-bit prefetchable above 4 GiB -> stop
+lspci -vv | grep -i ACS                                 # ACS on root ports/switches -> stop or disable it
+```
+
+Why no workaround: with working IOMMU translation, a bogus peer mapping is rejected. Without
+it, a bogus peer mapping is simply executed, and the failure mode is silent data corruption
+rather than a crash or a kernel warning. That is why this repository deliberately ships no
+"clone-board mode" and why the preflight gate refuses to run instead of falling back.
 
 ### BIOS / firmware settings
 
@@ -170,6 +210,10 @@ what was **not** tested, are in [`docs/test-results.md`](docs/test-results.md).
   `bash scripts/gen-topo.sh` to regenerate it from KFD (BDF, device id and gfx target all
   read from this machine), then reinstall or copy it to `/etc/p2p/topo-pxb.xml`. `preflight`
   fails loudly when the XML and the hardware disagree.
+- **Genuine X99 / C610 only.** This was developed and measured on a retail X99 board.
+  Rebadged clone boards usually lack working VT-d, Above-4G/ReBAR, or ACS control; see
+  [Genuine X99 / C610 only](#genuine-x99--c610-only) before attempting the install. The
+  refusal is intentional: without IOMMU translation the failure mode is silent corruption.
 - **The topology is a fiction.** It does not change hardware, it changes RCCL's path
   classification. Verify correctness with a **cross-rank latent** comparison, not with an
   output-file md5: the pipeline is non-deterministic across runs (cross-run latent
