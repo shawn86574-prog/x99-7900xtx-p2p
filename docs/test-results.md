@@ -15,7 +15,10 @@
 | 计算卡 | 2 × Radeon RX 7900 XTX 24 GB（`1002:744c`，05:00.0 / 08:00.0） |
 | 亮机卡 | GeForce GTX 750 Ti（`10de:1380`） |
 | 内核 | `7.0.0-38-generic`（`CONFIG_KRETPROBES=y`、`CONFIG_PCI_P2PDMA=y`） |
-| IOMMU | translated；两张卡分别在 group 52 / 56 |
+| IOMMU | translated；两张卡分别在 group 52 / 56，DMAR 主机地址宽度 46 位 |
+| GPU BAR | `Region 0` 32 GB，64-bit prefetchable，落在 `0x383000000000`（Above 4G + ReBAR 生效） |
+| ACS | 全总线 0 处 ACS 能力（未启用重定向） |
+| 启动参数 | `pcie_aspm=off`（ASPM 关闭） |
 | GPU 架构 | `gfx1100` × 2（`gfx_target_version` 110000） |
 | PyTorch | `2.13.0+rocm7.2` |
 | ROCm / RCCL | 7.2.0 / 2.27.7 |

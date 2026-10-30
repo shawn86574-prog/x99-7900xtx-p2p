@@ -60,7 +60,7 @@ All of these are hard prerequisites. `scripts/p2p-preflight.sh` checks every one
 | 1 | `amdgpu` is a **module**, not built into the kernel | `modinfo -n amdgpu` must not print `(builtin)` | built-in amdgpu probes before the hook loads, so peer access is already decided; a modular kernel is required |
 | 2 | Kernel exports `pci_p2pdma_distance_many` and has `CONFIG_KRETPROBES` / `CONFIG_PCI_P2PDMA` | `grep -qw pci_p2pdma_distance_many /proc/kallsyms`; `grep -E '^CONFIG_(KRETPROBES\|PCI_P2PDMA)=y' /boot/config-$(uname -r)` | module cannot build or attach |
 | 3 | Secure Boot off (or module signed + MOK-enrolled) | `mokutil --sb-state` | unsigned module refused |
-| 4 | IOMMU in **translated** mode (the default; not `iommu=off`, not `iommu=pt`) | each GPU has `/sys/bus/pci/devices/<bdf>/iommu_group`; `cat /proc/cmdline` | the VRAM BAR sits above the 44-bit DMA mask; mappings fail without translation |
+| 4 | IOMMU in **translated** mode (the default; not `iommu=off`, not `iommu=pt`), i.e. VT-d enabled in the BIOS | each GPU has `/sys/bus/pci/devices/<bdf>/iommu_group`; `cat /proc/cmdline` | the VRAM BAR sits above the 44-bit DMA mask; mappings fail without translation |
 | 5 | Two AMD GPUs sharing one gfx target | KFD `simd_count`, `gfx_target_version`, `location_id` | cross-architecture peer access is not supported |
 | 6 | Topology XML matches this machine's GPU BDFs | preflight compares `class="0x030000"` entries against KFD | RCCL never finds the cards; regenerate with `scripts/gen-topo.sh` |
 | 7 | RCCL **2.27.x** on Intel x86 | `python -c "import torch;print(torch.cuda.nccl.version())"` | the `PATH_PXB` hardcode this repo works around may be fixed or changed in other releases |
@@ -69,6 +69,33 @@ All of these are hard prerequisites. `scripts/p2p-preflight.sh` checks every one
 Verified fingerprint of this machine: `7.0.0-38-generic`, `CONFIG_KRETPROBES=y`,
 torch `2.13.0+rocm7.2`, RCCL `2.27.7`, two `1002:744c` at `05:00.0` / `08:00.0`,
 both inside IOMMU groups.
+
+### BIOS / firmware settings
+
+Nothing in this repo changes firmware. The settings below are what the measured machine
+actually has, and each can be verified from Linux after boot, so you do not have to trust
+menu labels. Exact strings differ per vendor (ASUS/Gigabyte/ASRock/MSI); the setting names
+in brackets are the common ones.
+
+| Setting | Required | Why it matters | Verify after boot |
+|---|---|---|---|
+| **VT-d / IOMMU** (`VT-d`, `IOMMU`, `Intel Virtualization Technology for Directed I/O`) | **Enabled** | the VRAM BAR is assigned at `0x383000000000` (46-bit host address space), above the GPU's 44-bit DMA mask; only translated IOMMU mappings can reach it | `journalctl -k -b \| grep 'DMAR: Host address width'` → `46`; `ls /sys/kernel/iommu_groups \| wc -l` → `60` here |
+| **Above 4G Decoding** (`Above 4G Decoding`, `Above 4G Memory`) | **Enabled** | without it the firmware cannot place the 32 GB GPU window above 4 GiB, and peer addressing collapses | `lspci -vv -s 05:00.0 \| grep 'Region 0'` → `Memory at 383000000000 (64-bit, prefetchable)` |
+| **Resizable BAR / Smart Access Memory** (`Re-Size BAR Support`, `SAM`) | **Enabled** (strongly recommended) | the measured config exposes the full 32 GB window; with ReBAR off the same slot would expose 256 MB, and the peer-bandwidth cost of that was **not measured** here | `Region 0` ends with `[size=32G]`; a 256 MB window reads `[size=256M]` |
+| **ACS** (`ACS Enabled`, `PCIe ACS`) | **Disabled**, or not exposed on the ports | ACS redirection forces cross-root-port traffic up through the root complex, defeating the direct PXB path (this is separate from IOMMU translation, which must stay on) | `lspci -vv \| grep -i ACS` returns nothing here (0 hits across the whole bus) |
+| **Secure Boot** | **Disabled** | the module is out-of-tree and unsigned; the installer aborts when Secure Boot is on | `mokutil --sb-state` |
+| **PCIe ASPM** | **Disabled** (or kernel `pcie_aspm=off`) | keeps the link out of low-power states during long collectives; this machine boots with `pcie_aspm=off` | `grep -o pcie_aspm=off /proc/cmdline` |
+| **PCIe AER** | **Enabled** (usually default) | `p2p-watch.sh` reads `aer_dev_correctable` / `aer_dev_fatal`; without AER those counters stay empty and you lose the corruption canary | `ls /sys/bus/pci/devices/0000:05:00.0/aer_dev_*` |
+
+Two rules that are easy to get wrong:
+
+- **Do not add `iommu=off` or `iommu=pt`** to the kernel cmdline. "Translated" is the default
+  DMA mode; passthrough removes exactly the translation this configuration needs.
+- **Any BIOS change requires a full reboot** — which is already required for `amdgpu` to
+  re-probe with the hook loaded, so do the firmware edits and the module install in one pass.
+
+After the reboot, `bash scripts/p2p-preflight.sh --env-only` re-checks the IOMMU group side;
+the BAR/ReBAR/ACS rows above are one-off `lspci` inspections.
 
 ### What reproduces, and what does not
 
@@ -83,6 +110,7 @@ both inside IOMMU groups.
 ## Quick start
 
 ```bash
+# BIOS first: VT-d on, Above 4G Decoding on, ReBAR on, ACS off, Secure Boot off (see table above)
 git clone https://github.com/shawn86574-prog/x99-7900xtx-p2p.git && cd x99-7900xtx-p2p
 bash scripts/gen-topo.sh                       # regenerate topo from this machine's KFD/BDF
 sudo bash kernel/install-p2p-kernel.sh --dkms  # build + DKMS + softdep + install topology
