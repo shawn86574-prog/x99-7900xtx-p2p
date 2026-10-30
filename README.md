@@ -50,13 +50,44 @@ off makes RCCL try P2P and fail. Either can be rolled back alone.
 | IOMMU | VT-d **translated**, not passthrough (required: the VRAM BAR sits at ~61.6 TiB, above the 44-bit DMA mask) |
 | Kernel / userspace | `7.0.0-38-generic`, ROCm 7.2.0, RCCL 2.27.7 |
 
+## Requirements and compatibility
+
+All of these are hard prerequisites. `scripts/p2p-preflight.sh` checks every one of them;
+`--env-only` runs just the checks without the probe.
+
+| # | Requirement | How to check | If it fails |
+|---|---|---|---|
+| 1 | `amdgpu` is a **module**, not built into the kernel | `modinfo -n amdgpu` must not print `(builtin)` | built-in amdgpu probes before the hook loads, so peer access is already decided; a modular kernel is required |
+| 2 | Kernel exports `pci_p2pdma_distance_many` and has `CONFIG_KRETPROBES` / `CONFIG_PCI_P2PDMA` | `grep -qw pci_p2pdma_distance_many /proc/kallsyms`; `grep -E '^CONFIG_(KRETPROBES\|PCI_P2PDMA)=y' /boot/config-$(uname -r)` | module cannot build or attach |
+| 3 | Secure Boot off (or module signed + MOK-enrolled) | `mokutil --sb-state` | unsigned module refused |
+| 4 | IOMMU in **translated** mode (the default; not `iommu=off`, not `iommu=pt`) | each GPU has `/sys/bus/pci/devices/<bdf>/iommu_group`; `cat /proc/cmdline` | the VRAM BAR sits above the 44-bit DMA mask; mappings fail without translation |
+| 5 | Two AMD GPUs sharing one gfx target | KFD `simd_count`, `gfx_target_version`, `location_id` | cross-architecture peer access is not supported |
+| 6 | Topology XML matches this machine's GPU BDFs | preflight compares `class="0x030000"` entries against KFD | RCCL never finds the cards; regenerate with `scripts/gen-topo.sh` |
+| 7 | RCCL **2.27.x** on Intel x86 | `python -c "import torch;print(torch.cuda.nccl.version())"` | the `PATH_PXB` hardcode this repo works around may be fixed or changed in other releases |
+| 8 | Kernel / distro in the tested range | `uname -r` | tested on `7.0.0-38-generic` with Ubuntu headers only |
+
+Verified fingerprint of this machine: `7.0.0-38-generic`, `CONFIG_KRETPROBES=y`,
+torch `2.13.0+rocm7.2`, RCCL `2.27.7`, two `1002:744c` at `05:00.0` / `08:00.0`,
+both inside IOMMU groups.
+
+### What reproduces, and what does not
+
+| Item | Reproducible by a third party? |
+|---|---|
+| `canAccessPeer` both ways, `isAllDirectP2p 1`, `via P2P/IPC` | **Yes**, on hardware/kernel/RCCL that satisfies the table above |
+| ~5.0 GB/s RCCL 16 MB allreduce, ~5.15 GB/s one-way peer copy | **Yes**, same conditions; absolute numbers depend on link width |
+| The video-pipeline speedup (85.00 s vs 88.91 s per step) | **No** — the private benchmark is not in this repo |
+| 4 h soak, kernel-upgrade, GPU-reset, IOMMU-off/ACS, 3-card variants | **No** — not completed here either; see `docs/test-results.md` §8 |
+| Bit-identical outputs across runs | **No** — the pipeline is non-deterministic across runs; only cross-rank latent equality is meaningful |
+
 ## Quick start
 
 ```bash
 git clone https://github.com/shawn86574-prog/x99-7900xtx-p2p.git && cd x99-7900xtx-p2p
-sudo bash kernel/install-p2p-kernel.sh --dkms   # build + DKMS + softdep + install topology
-sudo reboot                                     # amdgpu must re-probe with the hook in place
-bash scripts/p2p-preflight.sh                   # must print isAllDirectP2p 1 and via P2P/IPC
+bash scripts/gen-topo.sh                       # regenerate topo from this machine's KFD/BDF
+sudo bash kernel/install-p2p-kernel.sh --dkms  # build + DKMS + softdep + install topology
+sudo reboot                                    # amdgpu must re-probe with the hook in place
+bash scripts/p2p-preflight.sh                  # env gates, then isAllDirectP2p 1 / via P2P/IPC
 source scripts/p2p-env.sh && <your torchrun job>  # one process per GPU
 ```
 
@@ -107,8 +138,10 @@ what was **not** tested, are in [`docs/test-results.md`](docs/test-results.md).
   after every `linux-image-*` update. Never copy a prebuilt `.ko` across kernel versions.
 - **Secure Boot.** Must be off, or the module has to be signed and enrolled via MOK. The
   installer checks `mokutil --sb-state` and aborts if it is enabled.
-- **GPU BDF changes.** The XML pins `05:00.0` / `08:00.0`; move the cards, change slots, or
-  swap a card and you must edit `topo/fake_topo_p2p.xml` (and `/etc/p2p/topo-pxb.xml`).
+- **GPU BDF changes.** The shipped XML pins `05:00.0` / `08:00.0`. Run
+  `bash scripts/gen-topo.sh` to regenerate it from KFD (BDF, device id and gfx target all
+  read from this machine), then reinstall or copy it to `/etc/p2p/topo-pxb.xml`. `preflight`
+  fails loudly when the XML and the hardware disagree.
 - **The topology is a fiction.** It does not change hardware, it changes RCCL's path
   classification. Verify correctness with a **cross-rank latent** comparison, not with an
   output-file md5: the pipeline is non-deterministic across runs (cross-run latent

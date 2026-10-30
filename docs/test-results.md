@@ -14,7 +14,10 @@
 | 内存 | 128 GB DDR4 ECC |
 | 计算卡 | 2 × Radeon RX 7900 XTX 24 GB（`1002:744c`，05:00.0 / 08:00.0） |
 | 亮机卡 | GeForce GTX 750 Ti（`10de:1380`） |
-| 内核 | `7.0.0-38-generic` |
+| 内核 | `7.0.0-38-generic`（`CONFIG_KRETPROBES=y`、`CONFIG_PCI_P2PDMA=y`） |
+| IOMMU | translated；两张卡分别在 group 52 / 56 |
+| GPU 架构 | `gfx1100` × 2（`gfx_target_version` 110000） |
+| PyTorch | `2.13.0+rocm7.2` |
 | ROCm / RCCL | 7.2.0 / 2.27.7 |
 | 链路 | GPU 各 Gen4 x16，上行交换 Gen3 x8 |
 

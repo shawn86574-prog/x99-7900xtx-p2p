@@ -1,6 +1,6 @@
 # X99 双 7900 XTX · P2P 改动稳定性测试方案（优先级 P3）
 
-> 版本 v1.1，2026-10-30（已按加固落地后的实际状态校正；原 v1 为 2026-10-29）。被测对象：`~/x99-p2p-public/` 这套 P2P 强制方案。
+> 版本 v1.1，2026-10-30（已按加固落地后的实际状态校正；原 v1 为 2026-10-29）。被测对象：`~/x99-7900xtx-p2p/` 这套 P2P 强制方案。
 > 目的：回答三个问题——(1) 这些改动会不会影响系统稳定性；(2) 哪些极端工况下会失效；(3) 失效后怎么救、平时怎么监。
 
 ---
@@ -27,7 +27,7 @@
 |---|---|---|---|---|---|
 | C1 | `p2p_force.ko`：kretprobe 劫持 `pci_p2pdma_distance_many`，**仅当 `provider->vendor == 0x1002` 时**返回 1，其余放行真实值，`maxactive=32` | `/lib/modules/7.0.0-38-generic/updates/dkms/p2p_force.ko.zst` | 加载即生效，全局 | `dkms remove p2p-force/1.0 --all` + `depmod` + 重启 | 高 |
 | C2 | `softdep amdgpu pre: p2p_force` | `/etc/modprobe.d/99-p2p-force.conf` | 开机模块加载顺序 | 删该文件 + 重启 | 中 |
-| C3 | 伪造 PXB 拓扑（虚拟桥 `04:00.0` 下挂 `05:00.0` / `08:00.0`） | `~/x99-p2p-public/topo/fake_topo_p2p.xml` | 进程级，靠 `NCCL_TOPO_FILE` | 不设该变量即退回 SHM | 中（数据正确性） |
+| C3 | 伪造 PXB 拓扑（虚拟桥 `04:00.0` 下挂 `05:00.0` / `08:00.0`） | `~/x99-7900xtx-p2p/topo/fake_topo_p2p.xml` | 进程级，靠 `NCCL_TOPO_FILE` | 不设该变量即退回 SHM | 中（数据正确性） |
 | C4 | 运行期环境 `NCCL_TOPO_FILE` / `NCCL_P2P_LEVEL=PXB` / `NCCL_P2P_DISABLE=0` | 启动 shell 或 `scripts/p2p-env.sh` | 进程级 | 取消变量 | 低 |
 | C5 | 固化：DKMS（`p2p-force/1.0`）、`update-initramfs`、`/etc/p2p/topo-pxb.xml`、`/etc/profile.d/p2p-rccl.sh`、开机自检 `p2p-bootcheck.service` | `kernel/install-p2p-kernel.sh --dkms` | 开机自动 | 按 §5.1 L2 逐项删除 | 中 |
 
@@ -167,7 +167,7 @@ static int ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 采样命令：
 
 ```bash
-bash ~/x99-p2p-public/scripts/p2p-watch.sh -i 5 -d 14400 -o ~/p2p-logs/soak.csv
+bash ~/x99-7900xtx-p2p/scripts/p2p-watch.sh -i 5 -d 14400 -o ~/p2p-logs/soak.csv
 ```
 
 当前基线（22:24 冒烟）：`tainted=12289`、模块在位、KFD 链路 2 条、温度 44 ℃、功耗 25 W、AER 全 0、链路 `16.0GT/s x16`。

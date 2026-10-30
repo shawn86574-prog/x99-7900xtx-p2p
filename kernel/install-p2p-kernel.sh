@@ -31,9 +31,22 @@ grep -qw pci_p2pdma_distance_many /proc/kallsyms || die "当前内核没有 pci_
 if command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -qi enabled; then
   die "Secure Boot 已开启；p2p_force 未签名，请先关闭 Secure Boot，或签模块并注册 MOK"
 fi
-for bdf in 0000:05:00.0 0000:08:00.0; do
-  [[ -e "/sys/bus/pci/devices/${bdf}" ]] || echo "[WARN] 未找到 ${bdf}；拓扑文件里的 GPU 地址可能已变化"
-done
+amod="$(modinfo -n amdgpu 2>/dev/null || true)"
+case "${amod}" in
+  *"(builtin)"*) die "amdgpu 被编译进内核：钩子挂不上 probe 阶段，必须换模块化内核" ;;
+esac
+
+# 仓库自带拓扑只对应 05:00.0 / 08:00.0；其他机器先重新生成
+real_bdfs="$(lspci -D -d 1002: 2>/dev/null | awk '/VGA|Display|3D/{print $1}' | sort)"
+topo_bdfs="$(awk '/class="0x030000"/{ if (match($0,/busid="[^"]*"/)) print substr($0,RSTART+7,RLENGTH-8) }' "${DIR}/../topo/fake_topo_p2p.xml" | sort)"
+if [[ -z "${real_bdfs}" ]]; then
+  echo "[WARN] lspci 未找到 AMD 显示设备；稍后 preflight 会再校验"
+elif [[ "${topo_bdfs}" != "${real_bdfs}" ]]; then
+  echo "[WARN] 仓库拓扑与本机 GPU 地址不一致"
+  echo "       实机：$(echo ${real_bdfs})"
+  echo "       拓扑：$(echo ${topo_bdfs})"
+  echo "       先执行：bash ${DIR}/../scripts/gen-topo.sh，再重跑本脚本"
+fi
 
 say 1 "编译 ${MOD}.ko"
 make -C "/lib/modules/${KVER}/build" M="${DIR}" modules
@@ -81,7 +94,7 @@ fi
 say 4 "固化伪造拓扑到 /etc/p2p"
 install -d /etc/p2p
 install -m 0644 "${DIR}/../topo/fake_topo_p2p.xml" /etc/p2p/topo-pxb.xml
-echo "       /etc/p2p/topo-pxb.xml 已就位（GPU BDF 变化后必须同步改这个文件）"
+echo "       /etc/p2p/topo-pxb.xml 已就位（来自仓库拓扑；GPU BDF 变化请先跑 scripts/gen-topo.sh）"
 
 say 5 "固化 RCCL 环境到 /etc/profile.d"
 cat > /etc/profile.d/p2p-rccl.sh <<'EOF'

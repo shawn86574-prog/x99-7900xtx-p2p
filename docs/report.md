@@ -315,12 +315,12 @@ flowchart TB
 
 > **仓库里的那份 XML 不完全一样**
 >
-> 随附的 [`../topo/fake_topo_p2p.xml`](../topo/fake_topo_p2p.xml) 是最终生效的版本：虚拟桥是 `0000:04:00.0`（`1002:1479`），下挂 `0000:05:00.0` 与 `0000:08:00.0`，没有另建 00:01.0 这一层。上面这段保留了原始记录里的另一版写法。两者思路相同——把两块 GPU 归进同一个虚拟桥，路径类型就从 PHB 变成 PXB；换机器时按自己的 BDF 重写即可。
+> 随附的 [`../topo/fake_topo_p2p.xml`](../topo/fake_topo_p2p.xml) 是最终生效的版本：虚拟桥是 `0000:04:00.0`（`1002:1479`），下挂 `0000:05:00.0` 与 `0000:08:00.0`，没有另建 00:01.0 这一层。上面这段保留了原始记录里的另一版写法。两者思路相同——把两块 GPU 归进同一个虚拟桥，路径类型就从 PHB 变成 PXB。换机器时不要手改：直接跑 `bash scripts/gen-topo.sh`，它从本机 KFD 读 BDF、device id 和 gfx 架构重新生成；在这台机器上生成结果与随附文件逐字节一致。
 
 启动时必须满足另一个条件：**一进程一卡**。
 
 ```bash
-NCCL_TOPO_FILE=~/x99-p2p-public/topo/fake_topo_p2p.xml \
+NCCL_TOPO_FILE=~/x99-7900xtx-p2p/topo/fake_topo_p2p.xml \
   torchrun --nproc_per_node=2 torch_allreduce.py
 ```
 
@@ -566,14 +566,16 @@ sudo reboot
 或者直接用仓库里的安装脚本（`--dkms` 会注册 DKMS，内核升级后自动重编）：
 
 ```bash
-sudo bash ~/x99-p2p-public/kernel/install-p2p-kernel.sh --dkms
+# 不是 05:00.0 / 08:00.0 的机器，先按本机重新生成拓扑
+bash ~/x99-7900xtx-p2p/scripts/gen-topo.sh
+sudo bash ~/x99-7900xtx-p2p/kernel/install-p2p-kernel.sh --dkms
 ```
 
 ### 8.3 启用 RCCL 侧 P2P
 
 ```bash
 # 多进程，一进程一卡
-NCCL_TOPO_FILE=~/x99-p2p-public/topo/fake_topo_p2p.xml \
+NCCL_TOPO_FILE=~/x99-7900xtx-p2p/topo/fake_topo_p2p.xml \
   torchrun --nproc_per_node=2 torch_allreduce.py
 
 # 期望日志

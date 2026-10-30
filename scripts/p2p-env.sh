@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 在启动任何 RCCL 进程前 source 本文件：
-#   source ~/x99-p2p-public/scripts/p2p-env.sh
+#   source ~/x99-7900xtx-p2p/scripts/p2p-env.sh
 # 作用：强制 RCCL 读取伪造 PXB 拓扑，并确保 P2P 不被环境变量关掉。
 P2P_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
