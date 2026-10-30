@@ -1,0 +1,15 @@
+# 内核模块编译产物（在 kernel/ 目录下 make 时生成）
+*.ko
+*.ko.zst
+*.o
+*.mod
+*.mod.c
+*.symvers
+*.order
+.tmp_versions/
+Module.symvers
+modules.order
+
+# 日志与采样输出
+*.log
+*.csv
