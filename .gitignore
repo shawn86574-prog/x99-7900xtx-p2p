@@ -13,3 +13,6 @@ modules.order
 # 日志与采样输出
 *.log
 *.csv
+
+# 由 gen-topo.sh 现算的单卡可见变体，不入库（随机器 BDF 变化）
+topo/fake_topo_single.xml

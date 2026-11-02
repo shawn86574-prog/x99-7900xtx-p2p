@@ -199,6 +199,26 @@ The gap between +21–27% at the RCCL level and −4.4% end to end is expected: 
 step over ~85 s, communication is still the minority of the runtime. Full numbers, including
 what was **not** tested, are in [`docs/test-results.md`](docs/test-results.md).
 
+### ComfyUI MiniMax-H3 TP2 (two processes, one visible card each)
+
+A second consumer of this fake topology runs two ComfyUI processes, each with only its own
+card visible (`HIP_VISIBLE_DEVICES=<rank>`). In that shape the local device ordinal is always
+0, so the `dev == rank` XML produced by `scripts/gen-topo.sh` points rank 1 at rank 0's card and
+RCCL aborts with `Ring 0: Asymmetric link! Rank 0 -> 1, but 1 -> 1`. Generate the
+single-visible variant instead (`bash scripts/gen-topo.sh --single-visible`, installed to
+`/etc/p2p/topo-pxb-single.xml`, never over `/etc/p2p/topo-pxb.xml`).
+
+Measured on the same machine (MiniMax-H3 int8, 960×544, 124 frames, 10 steps): steady state
+**16.00 → 11.65 s/step** (1.37x), end to end 214.3 → 172.4 s, identical output md5 on both
+ranks. See [`docs/comfyui-tp2.md`](docs/comfyui-tp2.md).
+
+Re-verified on 2026-11-03 (2× RX 7900 XTX, 832×480, 121 frames, 4 steps, w4a8 + turbo LoRA):
+with weights resident, end to end **79.4 s**, both ranks finishing in lockstep (79.4 / 79.4 s),
+GPUs simultaneously busy **62 of 68 s (91%)** (mean utilisation 97.6% / 79.0%), 23.7 GB per card.
+A cold run of the same shape took 321.4 s. Watch out for ComfyUI caching identical prompts
+(a repeat returns in ~1 s with the second card idle) and for the misleading `per_step` field —
+see the pitfalls section of the doc.
+
 ## Caveats
 
 - **Kernel upgrades.** The module is out-of-tree and compiled against the running kernel's
@@ -209,7 +229,10 @@ what was **not** tested, are in [`docs/test-results.md`](docs/test-results.md).
 - **GPU BDF changes.** The shipped XML pins `05:00.0` / `08:00.0`. Run
   `bash scripts/gen-topo.sh` to regenerate it from KFD (BDF, device id and gfx target all
   read from this machine), then reinstall or copy it to `/etc/p2p/topo-pxb.xml`. `preflight`
-  fails loudly when the XML and the hardware disagree.
+  fails loudly when the XML and the hardware disagree. If your launcher gives each process
+  only one visible card, regenerate with `--single-visible` instead; the `dev` field differs
+  between the two shapes and mixing them breaks ring setup (see
+  [`docs/comfyui-tp2.md`](docs/comfyui-tp2.md)).
 - **Genuine X99 / C610 only.** This was developed and measured on a retail X99 board.
   Rebadged clone boards usually lack working VT-d, Above-4G/ReBAR, or ACS control; see
   [Genuine X99 / C610 only](#genuine-x99--c610-only) before attempting the install. The
@@ -254,6 +277,8 @@ commands handy, and do not deploy it where silent data corruption is unacceptabl
   matrix, rollback levels, monitoring points (Chinese).
 - [`docs/test-results.md`](docs/test-results.md) — measured numbers and the corrected
   acceptance criteria (Chinese).
+- [`docs/comfyui-tp2.md`](docs/comfyui-tp2.md) — two-process / single-card-visible TP2, the
+  `dev` vs `rank` pitfall, and the ComfyUI benchmark numbers (Chinese).
 
 ## License
 

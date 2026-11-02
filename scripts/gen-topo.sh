@@ -1,12 +1,27 @@
 #!/usr/bin/env bash
 # 从本机 KFD 真实拓扑生成 RCCL 伪造 PXB 拓扑：
 #   BDF、device id、gfx 架构全部取自 /sys/class/kfd，不依赖手改。
-# 用法：bash scripts/gen-topo.sh [输出路径]
+# 用法：bash scripts/gen-topo.sh [--single-visible] [输出路径]
 # 默认写 topo/fake_topo_p2p.xml（安装脚本会把同一份文件装到 /etc/p2p/topo-pxb.xml）。
+#
+# --single-visible：给「每个进程只可见一张卡」的启动方式（HIP_VISIBLE_DEVICES=<rank>）。
+#   此时进程内本卡恒为设备号 0，XML 里的 dev 必须等于本地设备号，故两张卡都写 dev="0"；
+#   RCCL 靠 rank 属性认卡，不靠 dev 序号。产物默认写 topo/fake_topo_single.xml，
+#   安装到独立路径（/etc/p2p/topo-pxb-single.xml），不覆盖两卡同进程可见时用的
+#   /etc/p2p/topo-pxb.xml。
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT="${1:-${DIR}/../topo/fake_topo_p2p.xml}"
+MODE=rank
+if [[ "${1:-}" == "--single-visible" ]]; then
+  MODE=zero
+  shift
+fi
+if [[ "${MODE}" == "zero" ]]; then
+  OUT="${1:-${DIR}/../topo/fake_topo_single.xml}"
+else
+  OUT="${1:-${DIR}/../topo/fake_topo_p2p.xml}"
+fi
 KFD=/sys/class/kfd/kfd/topology/nodes
 
 fail() { echo "[FAIL] $*" >&2; exit 1; }
@@ -65,8 +80,9 @@ bridge=$(basename "$(dirname "$(readlink -f "/sys/bus/pci/devices/${first_bdf}")
   echo '    <pci busid="'"${bridge}"'" class="0x060400" vendor="0x1002" device="0x1479" link_speed="16.0 GT/s PCIe" link_width="16">'
   rank=0
   while read -r _bus bdf hexid gfx; do
+    if [[ "${MODE}" == "zero" ]]; then dev=0; else dev="${rank}"; fi
     echo "      <pci busid=\"${bdf}\" class=\"0x030000\" vendor=\"0x1002\" device=\"${hexid}\" link_speed=\"16.0 GT/s PCIe\" link_width=\"16\">"
-    echo "        <gpu dev=\"${rank}\" sm=\"48\" gcn=\"${gfx}\" arch=\"38911\" rank=\"${rank}\" gdr=\"0\"/>"
+    echo "        <gpu dev=\"${dev}\" sm=\"48\" gcn=\"${gfx}\" arch=\"38911\" rank=\"${rank}\" gdr=\"0\"/>"
     echo '      </pci>'
     rank=$((rank + 1))
   done < <(printf '%s' "${rows}" | sort -n -k1,1)
@@ -77,4 +93,9 @@ bridge=$(basename "$(dirname "$(readlink -f "/sys/bus/pci/devices/${first_bdf}")
 
 echo "[OK] 已生成 ${OUT}"
 printf '%s' "${rows}" | sort -n -k1,1 | awk '{printf "     %-14s %-6s %s\n", $2, $3, $4}'
-echo "     下一步：sudo bash kernel/install-p2p-kernel.sh --dkms（会把这份文件装到 /etc/p2p/topo-pxb.xml）"
+if [[ "${MODE}" == "zero" ]]; then
+  echo "     安装：sudo install -m 644 ${OUT} /etc/p2p/topo-pxb-single.xml"
+  echo "           NCCL_TOPO_FILE=/etc/p2p/topo-pxb-single.xml NCCL_P2P_LEVEL=PXB <单卡可见的启动器>"
+else
+  echo "     下一步：sudo bash kernel/install-p2p-kernel.sh --dkms（会把这份文件装到 /etc/p2p/topo-pxb.xml）"
+fi
