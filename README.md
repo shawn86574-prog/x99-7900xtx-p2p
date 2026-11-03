@@ -219,6 +219,23 @@ A cold run of the same shape took 321.4 s. Watch out for ComfyUI caching identic
 (a repeat returns in ~1 s with the second card idle) and for the misleading `per_step` field —
 see the pitfalls section of the doc.
 
+### Sharing the two cards with a resident server
+
+In our setup the same machine also runs a resident layer-split LLM server. TP2 peaks at
+~23.9 GB per card and the server at ~23 GB per card, so on 24.5 GB cards they cannot coexist —
+shrinking the server's resident footprint cannot free a whole card either. The launchers therefore
+take an explicit card-ownership lease: `acquire` suspends the server, `holder` tracks the real
+engine PID, and `release` (or a 30 s watchdog when the job dies) restores it and waits for
+`/health`. A work-mode job also makes the server refuse to start, and a stale lease from a
+previous boot is cleared by an `ExecStartPre` guard. See
+[`docs/dual-gpu-ownership.md`](docs/dual-gpu-ownership.md) and
+[`scripts/gpu-owner.sh`](scripts/gpu-owner.sh).
+
+Scope note: this topology patch only helps tensor-parallel workloads that go through RCCL
+collectives. Engines that never read `NCCL_TOPO_FILE` — layer-split runners included — gain
+nothing from it, and tensor parallelism is usually *slower* than layer split for single-stream
+decode.
+
 ## Caveats
 
 - **Kernel upgrades.** The module is out-of-tree and compiled against the running kernel's
@@ -279,6 +296,9 @@ commands handy, and do not deploy it where silent data corruption is unacceptabl
   acceptance criteria (Chinese).
 - [`docs/comfyui-tp2.md`](docs/comfyui-tp2.md) — two-process / single-card-visible TP2, the
   `dev` vs `rank` pitfall, and the ComfyUI benchmark numbers (Chinese).
+- [`docs/dual-gpu-ownership.md`](docs/dual-gpu-ownership.md) — card-ownership lease between a
+  resident LLM server and TP jobs, watchdog-based auto-restore, and the applicability limits
+  (Chinese).
 
 ## License
 
