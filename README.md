@@ -299,6 +299,10 @@ commands handy, and do not deploy it where silent data corruption is unacceptabl
 - [`docs/dual-gpu-ownership.md`](docs/dual-gpu-ownership.md) — card-ownership lease between a
   resident LLM server and TP jobs, watchdog-based auto-restore, and the applicability limits
   (Chinese).
+- [`docs/tp2-default-policy.md`](docs/tp2-default-policy.md) — default-on **TP=2 + P2P**
+  policy: single-card launch entries pop a notice and silently redirect to the dual-instance
+  launcher; `TP_ALLOW_SINGLE=1` is the explicit single-GPU override
+  ([`scripts/tp2-guard.sh`](scripts/tp2-guard.sh)) (Chinese).
 
 ## License
 
