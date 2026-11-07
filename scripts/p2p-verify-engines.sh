@@ -58,3 +58,4 @@ echo
 echo "=== 运行期铁证（需引擎侧开启 NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT）"
 echo "    期望：NCCL_TOPO_FILE set by environment to ... / isAllDirectP2p 1 / via P2P/IPC"
 echo "    失败：via SHM/direct/direct"
+exit 0

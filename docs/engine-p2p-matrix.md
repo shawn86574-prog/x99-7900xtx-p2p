@@ -8,7 +8,7 @@
 | 引擎 / 形态 | 每进程可见卡 | P2P 是否生效 | 证据 |
 |---|---|---|---|
 | ComfyUI TP2（双进程，各 `HIP_VISIBLE_DEVICES=$r`） | 1 张 | ✅ 生效 | 进程 env 内 `NCCL_TOPO_FILE` 指向单卡可见版拓扑 |
-| **vLLM TP=2（单进程双卡可见）** | 2 张 | ❌ **失效** | 真正建通信子的 worker 进程 env 里 `NCCL_*` 计数为 **0** |
+| **vLLM TP=2（单进程双卡可见）** | 2 张 | ✅ 生效（须 `/etc/rccl.conf`） | 修复后实测 `isAllDirectP2p 1` + `via P2P/IPC`，而 worker env 里 `NCCL_` 仅剩 `DEBUG` 两项 |
 | SGLang TP=2（单进程双卡可见） | 2 张 | ⚠️ 机制上成立，待实测 | 标准 `mp.Process` spawn，无 env 白名单（源码证据） |
 | Strata（层切分 + 专家并行） | 2 张 | — 与本机制无关 | 不走 RCCL，用 HIP `cudaMemcpyPeer` + 自带双向比对 |
 
@@ -73,6 +73,41 @@ mp.get_context('spawn').Process(target=child).start()
 ```
 
 结果就是：**内核 P2P 明明开着，vLLM 却仍然走主机内存中转**。
+
+### 2.4 还有第二重原因：启动环境里 `NCCL_P2P_DISABLE=1`
+
+实测旧实例（pid 55252）的 driver env：
+
+```
+NCCL_P2P_DISABLE=1      ← 显式关闭
+NCCL_P2P_LEVEL=PXB
+NCCL_TOPO_FILE=/etc/p2p/topo-pxb.xml
+```
+
+即使 §2.1 的 worker 环境问题不存在，这一条也会让 P2P 直接关掉。而且**环境变量优先级高于 `/etc/rccl.conf`**，所以配置文件救不了它 —— 必须在启动侧清掉。
+
+### 2.5 修复后实测（决定性对照）
+
+停掉旧实例，用**只保留 shell 环境、剔除全部 `NCCL_*`** 的方式重启，拓扑仅由 `/etc/rccl.conf` 提供：
+
+```
+[relaunch] env=123 个变量，NCCL_TOPO_FILE 已移除
+MasterMonster:63117 [0] NCCL INFO Check P2P Type isAllDirectP2p 1 directMode 0
+MasterMonster:63117 [0] NCCL INFO Channel 00/0 : 0[5000] -> 1[8000] via P2P/IPC
+MasterMonster:63117 [0] NCCL INFO Channel 01/0 : 0[5000] -> 1[8000] via P2P/IPC
+MasterMonster:63118 [1] NCCL INFO Channel 00/0 : 1[8000] -> 0[5000] via P2P/IPC
+MasterMonster:63118 [1] NCCL INFO Channel 01/0 : 1[8000] -> 0[5000] via P2P/IPC
+```
+
+同时该实例的 worker 进程（真正建通信子的那两个）环境是：
+
+| 进程 | 变量数 | `NCCL_*` |
+|---|---|---|
+| `VLLM::EngineCore` 63012 | 17 | 2（`NCCL_DEBUG`、`NCCL_DEBUG_SUBSYS`） |
+| `VLLM::Worker_TP0` 63117 | 19 | 2（同上） |
+| `VLLM::Worker_TP1` 63118 | 19 | 2（同上） |
+
+**没有任何 `NCCL_TOPO_FILE` / `NCCL_P2P_DISABLE` / `NCCL_P2P_LEVEL`，P2P 依然生效** —— 这就是配置文件兜底的直接证明。
 
 ## 三、另外两个引擎
 
@@ -169,12 +204,21 @@ bash scripts/p2p-verify-engines.sh
 要拿运行期铁证，给引擎加 `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT`，启动日志里应出现：
 
 ```
-NCCL_TOPO_FILE set by environment to /etc/p2p/topo-pxb.xml
-isAllDirectP2p 1
-via P2P/IPC
+Check P2P Type isAllDirectP2p 1 directMode 0
+Channel 00/0 : 0[5000] -> 1[8000] via P2P/IPC
 ```
 
 出现 `via SHM/direct/direct` 即仍未生效。
+
+### 4.6 唯一能破坏它的东西
+
+**任何启动脚本里 `export NCCL_P2P_DISABLE=1`。** 环境变量优先级高于配置文件，写进 conf 的 `0` 会被覆盖。此前那个 vLLM 实例就是带着 `NCCL_P2P_DISABLE=1` 启动的。
+
+检查口径：
+
+```bash
+grep -rn "NCCL_P2P_DISABLE=1" ~/.bashrc /etc/profile.d/ /path/to/launcher/*.sh
+```
 
 ## 五、排查口径（三条）
 
@@ -185,5 +229,5 @@ via P2P/IPC
 ## 六、这次没做到的
 
 - SGLang 的运行期实证（两卡被占满，未抢卡实测）；
-- vLLM 侧"哪一行代码重建了 env"未定位到具体行号——只坐实了**结果**（进程 env 无 `NCCL_*`）与**排除项**（不是 Python spawn 的通用行为）。修复方案不依赖这个定位；
-- `/etc/rccl.conf` 生效后的 vLLM 带宽复测（需停掉在跑的任务）。
+- vLLM 侧"哪一行代码重建了 env"未定位到具体行号——只坐实了**结果**（进程 env 无 `NCCL_TOPO_FILE`）与**排除项**（不是 Python spawn 的通用行为）。修复方案不依赖这个定位；
+- `/etc/rccl.conf` 生效前后的 **allreduce 带宽数字对比**（本次只拿到 `via P2P/IPC` 的通道证据，没跑吞吐基准）。
