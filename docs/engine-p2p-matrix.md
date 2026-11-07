@@ -9,7 +9,7 @@
 |---|---|---|---|
 | ComfyUI TP2（双进程，各 `HIP_VISIBLE_DEVICES=$r`） | 1 张 | ✅ 生效 | 进程 env 内 `NCCL_TOPO_FILE` 指向单卡可见版拓扑 |
 | **vLLM TP=2（单进程双卡可见）** | 2 张 | ✅ 生效（须 `/etc/rccl.conf`） | 修复后实测 `isAllDirectP2p 1` + `via P2P/IPC`，而 worker env 里 `NCCL_` 仅剩 `DEBUG` 两项 |
-| SGLang TP=2（单进程双卡可见） | 2 张 | ⚠️ 机制上成立，待实测 | 标准 `mp.Process` spawn，无 env 白名单（源码证据） |
+| SGLang TP=2（单进程双卡可见） | 2 张 | ✅ 生效（须 `/etc/rccl.conf`） | 实测 `isAllDirectP2p 1` + `via P2P/IPC`×6、`via SHM`×0；scheduler 进程 env 仅 20 个变量、`NCCL_` 只剩 `DEBUG` 两项 |
 | Strata（层切分 + 专家并行） | 2 张 | — 与本机制无关 | 不走 RCCL，用 HIP `cudaMemcpyPeer` + 自带双向比对 |
 
 **一句话**：P2P 能否生效，不取决于你 `source` 过什么脚本，而取决于**真正调用 RCCL 的那个进程**能不能读到 `NCCL_TOPO_FILE`。
@@ -111,13 +111,29 @@ MasterMonster:63118 [1] NCCL INFO Channel 01/0 : 1[8000] -> 0[5000] via P2P/IPC
 
 ## 三、另外两个引擎
 
-### 3.1 SGLang：机制上没问题
+### 3.1 SGLang：同样依赖 `/etc/rccl.conf`（原判断已被实测推翻）
 
-- `sglang.launch_server` 用标准 `mp.Process` + `spawn`，**没有** env 白名单；
-- 启动脚本 `sglang-tp.sh` 的 tp2 分支不设 `HIP_VISIBLE_DEVICES`（双卡可见），与 `topo-pxb.xml` 的 `dev=0/1` 一致；
-- 因此 `NCCL_*` 会一路继承到 scheduler/tp worker。
+最初只看源码得出的结论是「标准 `mp.Process` spawn、无 env 白名单，所以会继承」——**实测否定了这个推断**。
 
-待办：在两张卡空闲时跑一次 `sglang-tp.sh start tp2` 并 `grep isAllDirectP2p` 取运行期实证（本次实测时两卡被 vLLM 占满，未做）。
+以 `sglang-tp.sh start tp2` 启动（`--tp-size 2`、双卡可见），运行期实测：
+
+| 进程 | PID | 变量数 | `NCCL_*` |
+|---|---|---|---|
+| `sglang.launch_server` | 66239 | 126 | 5 |
+| `sglang::scheduler_TP0` | 66678 | **20** | **2**（仅 `NCCL_DEBUG`、`NCCL_DEBUG_SUBSYS`） |
+| `sglang::scheduler_TP1` | 66679 | **20** | **2**（同上） |
+
+真正建通信子的 scheduler 进程同样拿不到 `NCCL_TOPO_FILE`。日志却显示：
+
+```
+Check P2P Type isAllDirectP2p 1 directMode 0
+Channel 00/0 : 0[5000] -> 1[8000] via P2P/IPC
+Channel 01/0 : 1[8000] -> 0[5000] via P2P/IPC
+```
+
+`via P2P/IPC` 出现 6 次，`via SHM` 0 次 —— **拓扑完全来自 `/etc/rccl.conf`**。
+
+结论修正：**vLLM 与 SGLang 都会重建子进程环境**，这不是某一家的特例，而是这类框架的共性。所以 `/etc/rccl.conf` 不是"vLLM 专用补丁"，而是两个框架的共同前提。
 
 ### 3.2 Strata：根本不用 RCCL
 
@@ -228,6 +244,5 @@ grep -rn "NCCL_P2P_DISABLE=1" ~/.bashrc /etc/profile.d/ /path/to/launcher/*.sh
 
 ## 六、这次没做到的
 
-- SGLang 的运行期实证（两卡被占满，未抢卡实测）；
 - vLLM 侧"哪一行代码重建了 env"未定位到具体行号——只坐实了**结果**（进程 env 无 `NCCL_TOPO_FILE`）与**排除项**（不是 Python spawn 的通用行为）。修复方案不依赖这个定位；
 - `/etc/rccl.conf` 生效前后的 **allreduce 带宽数字对比**（本次只拿到 `via P2P/IPC` 的通道证据，没跑吞吐基准）。
