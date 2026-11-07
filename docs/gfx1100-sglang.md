@@ -131,14 +131,33 @@ cp -a /home/jay/sglang-backup-20261107-2352/sglang-pkg <site-packages>/sglang
 
 **接受率是另一个约束**：`accept len` 稳定在 2.1–3.1 / 8，即 26%–39%。draft 是按官方 Qwen3.8-27B 训练的，而 target 是 abliterated-AWQ-INT4 微调版，分布有漂移，接受率上不去。原帖能到 193 tok/s 是数学 CoT 场景（结构化、可预测度高），通用短文本达不到。
 
-### 结论：按并发切两档
+## 四·补 DSpark 投机解码实测：跑得通，但全面输给 DFlash2
 
-| 场景 | 配置 | 吞吐 |
+DSpark 是 Qwen3.8 官方配套预设，需要**专门训练的 draft 头**（`markov_rank>0`，配置里就是 `DSparkDraftModel`），DFlash2 的 draft 没有 Markov 头会被直接拒绝。27B 的 DSpark 头：ModelScope `RadixArk/Qwen3.8-27B-DSpark`（3542.6 MiB 完整，3714723322 字节，与 safetensors 声明精确一致），`gamma=7 → num_draft_tokens=8`（这是它的一条硬校验：必须 `gamma+1`）。
+
+draft 本体比 DFlash2 小一半：加载 `type=DSparkDraftModel, mem usage=2.05 GB`（DFlash2 路径是 4 GB），proposal 折入 CUDA graph。
+
+| 并发 | 无投机 | DFlash2 | DSpark | DSpark vs DFlash2 |
+|---|---|---|---|---|
+| 1 | 28.2 | **49.5** | 46.6 | −5.9% |
+| 4 | **147.1** | 109.7 | 100.0 | −8.8% |
+| 8 | **151.6** | 108.1 | 100.6 | −6.9% |
+
+接受率同样低：`accept len` 2.15–2.64 / 8（27%–33%），draft 是给官方 Qwen3.8-27B 训的、target 是 abliterated 微调版，分布漂移一视同仁。
+
+**独立旁证**：mlx-dspark 项目（PyPI）在 Qwen3.8-27B 上的公开结论与此一致——"the DFlash 2 drafter beats the DSpark heads at the identical verify width"。
+
+DSpark 唯一亮点：单流 TTFT p50 308 ms（DFlash2 更高）、省 2 GB 显存；但吞吐三项全输。
+
+### 三模式终局（同一台机、同一 target、每级 4 轮）
+
+| 场景 | 最优模式 | 吞吐 |
 |---|---|---|
-| 单人交互、Agent 单线推理 | 开 DFlash2 | 49.5 tok/s |
-| 多路并发、批量任务 | 关 DFlash2 | 147–152 tok/s |
+| 单流 | DFlash2 | 49.5 tok/s |
+| 并发（4-8 流） | 无投机 | 147–152 tok/s |
+| — | DSpark | 任何场景都不选（除非显存极限要省 2 GB） |
 
-脚本已支持用 `DFLASH_DRAFT` 控制：指向有效目录即启用，设为空或不存在则自动回退到无 draft 配置。
+脚本口径：`SPEC_ALGO=dflash|dspark` 切算法，`DFLASH_DRAFT` 指向对应 draft 目录（`Qwen3.8-27B-DFlash2` / `Qwen3.8-27B-DSpark`），`DRAFT_TOKENS` 按算法给（dflash 8、dspark 8=gamma+1）。
 
 ## 五、还没做的
 
