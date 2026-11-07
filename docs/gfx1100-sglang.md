@@ -101,8 +101,48 @@ cp -a /home/jay/sglang-backup-20261107-2352/sglang-pkg <site-packages>/sglang
 
 备份还包含 `pip_freeze.txt` 与 `sgl_kernel` 目录快照。
 
-## 四、还没做的
+## 四、DFlash2 投机解码实测：单流赚，并发亏
 
-- **DFlash2 投机解码**：模型 `incoai/Qwen3.8-27B-DFlash2`（3.67 GB）未下载成功——本机 fake-ip + 代理节点在协议层全挂（30/30 节点握手失败，套餐流量还剩 192 GB，非流量问题）。代理恢复后按 README 加 `--speculative-algorithm dflash --speculative-draft-model-path ...`。
-- `--max-mamba-cache-size` 从 24 提到 40，验证 8 并发能否突破 151 tok/s。
+模型来源：`z-lab/Qwen3.8-27B-DFlash2`（ModelScope，3670.5 MiB，BF16，81 张量，5 层，`DFlash2DraftModel`）。HF 原仓 `incoai/Qwen3.8-27B-DFlash2` 国内不可达，ModelScope 有同文件副本，直链约 34 MB/s。
+
+启动参数：
+
+```
+--speculative-algorithm dflash
+--speculative-draft-model-path /mnt/llm/sglang/models/Qwen3.8-27B-DFlash2
+--speculative-num-draft-tokens 8
+--speculative-draft-window-size 2048
+--mem-fraction-static 0.79   # 从 0.83 下调，给 BF16 draft 腾 4 GB
+```
+
+| 并发 | 官方 0.5.10 | gfx1100（无 draft） | gfx1100 + DFlash2 |
+|---|---|---|---|
+| 1 | 17.7 | 28.2 | **49.5（+75.5%）** |
+| 2 | 33.8 | 77.1 | — |
+| 4 | 61.3 | **147.1** | 109.7（−25.4%） |
+| 8 | 106.5 | **151.6** | 108.1（−28.7%） |
+
+**存在明确的并发拐点**：单流 49.5 tok/s 是本机最高，但从 2 流往上 draft 开始拖累。
+
+原因有两条：
+
+1. draft verify 的 CUDA graph 只覆盖 `bs=[1,2,3,4]`，并发超过 4 后走非图路径。
+2. draft 本身要占 4 GB 显存和实打实的算力，高并发时与 target 抢 GPU（util 从 96% 降到 95% 但总吞吐腰斩）。
+
+**接受率是另一个约束**：`accept len` 稳定在 2.1–3.1 / 8，即 26%–39%。draft 是按官方 Qwen3.8-27B 训练的，而 target 是 abliterated-AWQ-INT4 微调版，分布有漂移，接受率上不去。原帖能到 193 tok/s 是数学 CoT 场景（结构化、可预测度高），通用短文本达不到。
+
+### 结论：按并发切两档
+
+| 场景 | 配置 | 吞吐 |
+|---|---|---|
+| 单人交互、Agent 单线推理 | 开 DFlash2 | 49.5 tok/s |
+| 多路并发、批量任务 | 关 DFlash2 | 147–152 tok/s |
+
+脚本已支持用 `DFLASH_DRAFT` 控制：指向有效目录即启用，设为空或不存在则自动回退到无 draft 配置。
+
+## 五、还没做的
+
+- `--max-mamba-cache-size` 从 24 提到 40，验证 8 并发能否突破 151 tok/s（当前被 mamba state cache 压到 4 并发）。
 - 魔改版的 custom all-reduce（`scripts/rdna_ar/rdna_ar_ext.py`）未安装，当前仍用 `--disable-custom-all-reduce`。
+- W4A16 版 draft（`Qwen3.8-27B-DFlash2-W4A16`）未找到国内镜像；换成量化 draft 后可省约 2 GB 显存，也许能把拐点从 2 流推到 4 流。
+- 长上下文（3k+ prompt）场景未测。HiCache 与 DFlash2 在该场景的价值应明显高于短文本压测。
