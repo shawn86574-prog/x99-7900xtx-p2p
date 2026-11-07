@@ -61,6 +61,34 @@ TP rank。结论：**冲突的本质是整卡占用权，不是“谁多占了�
 | `release` 恢复 | 成功，`/health` 返回 `ok`，模型已加载 |
 | 回归 | 挂起→拒绝→恢复全链路通过，占用权回到 `daily` |
 
+## 案例（2026-11-07）：节点子进程挡住 acquire
+
+ComfyUI TP 作业已停、常驻服务已挂起，`acquire` 仍连续两次失败，报
+`显存未回落到 1500 MiB 以下：card0 9733/24560MiB card2 9675/24560MiB`。
+此时没有任何 ComfyUI 主进程存活，`nvidia-smi` 也查不到 compute app——但 amdgpu 的
+`mem_info_vram_used` 实打实各占 9.7 GB。
+
+根因：`ComfyUI_Qwen_H3_Prompt` 节点自行 spawn 的 `llama-serve` 后端进程在主进程退出后
+**没有跟着退出**，成了孤儿，双卡各攥着 ~9.7 GB。定位手段是按文件句柄反查持有者：
+
+```bash
+for p in /proc/[0-9]*; do
+  ls -l $p/fd 2>/dev/null | grep -qE 'drm|dma-buf|kfd' \
+    && echo "${p#/proc/} $(tr '\0' ' ' < $p/cmdline)"
+done
+# → 292464 .../ComfyUI_Qwen_H3_Prompt/runtime/.../llama-serve
+kill 292464   # 两卡随即回落到 48 MiB，acquire 通过
+```
+
+对占用权机制的三点修正/提示：
+
+1. **停 TP 作业要停进程组**，或 `release`/停止入口先按上述句柄反查清掉节点 spawn 的
+   长驻子进程——否则 `wait_vram_free` 会一直等到超时，失败原因看起来像「服务没停干净」。
+2. **`nvidia-smi` 不是本机判据**（ROCm 栈），显存是否释放以
+   `/sys/class/drm/card*/device/mem_info_vram_used` 为准，这正是 `acquire` 读的口径。
+3. 该 ComfyUI 实例是绕过 `acquire` 手动启动的，因此它的子进程**不在 holder 追踪范围内**：
+   占用权机制只对「先 acquire 再启动」的正规接线有效，旁路启动的负载要人工负责收尾。
+
 ## 与 topo 补丁的适用范围
 
 `NCCL_TOPO_FILE` 只被 RCCL 读取，因此本仓库的拓扑修复/rank 绑定修复**只对张量并行 + RCCL
