@@ -39,6 +39,7 @@ value is overwritten later by that Intel rule.
 | Kernel | [`kernel/p2p_force.c`](kernel/p2p_force.c) | kretprobe, return handler on `pci_p2pdma_distance_many`; entry handler checks `provider->vendor == PCI_VENDOR_ID_ATI`, so only AMD peers get a faked distance and `xe` / `habanalabs` / `nvmet` keep the real value |
 | Topology | [`topo/fake_topo_p2p.xml`](topo/fake_topo_p2p.xml) | puts both GPUs under one virtual bridge so RCCL classifies the path as PXB instead of PHB — process-local, no hardware change |
 | Runtime env | [`scripts/p2p-env.sh`](scripts/p2p-env.sh) | exports `NCCL_TOPO_FILE`, `NCCL_P2P_DISABLE=0`, `NCCL_P2P_LEVEL=PXB`, `NCCL_DEBUG_SUBSYS=INIT` |
+| Runtime config | [`scripts/install-rccl-conf.sh`](scripts/install-rccl-conf.sh) | writes `/etc/rccl.conf` so RCCL reads the topology even in processes whose environment was rebuilt (vLLM `EngineCore`/`Worker` drop every `NCCL_*`); environment variables still win when present |
 
 Each layer is independent: kernel on + topology off still yields SHM; topology on + kernel
 off makes RCCL try P2P and fail. Either can be rolled back alone.
@@ -299,6 +300,10 @@ commands handy, and do not deploy it where silent data corruption is unacceptabl
 - [`docs/dual-gpu-ownership.md`](docs/dual-gpu-ownership.md) — card-ownership lease between a
   resident LLM server and TP jobs, watchdog-based auto-restore, and the applicability limits
   (Chinese).
+- [`docs/engine-p2p-matrix.md`](docs/engine-p2p-matrix.md) — which engines actually get P2P
+  (ComfyUI / vLLM / SGLang / Strata), why a vLLM TP=2 instance runs but still falls back to
+  SHM (worker processes carry `NCCL_*=0`), and the `/etc/rccl.conf` fix that survives
+  environment rebuilding (Chinese).
 - [`docs/tp2-default-policy.md`](docs/tp2-default-policy.md) — default-on **TP=2 + P2P**
   policy: single-card launch entries pop a notice and silently redirect to the dual-instance
   launcher; `TP_ALLOW_SINGLE=1` is the explicit single-GPU override
