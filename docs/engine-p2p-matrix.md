@@ -346,3 +346,27 @@ Channel 00/0 : 0[5000] -> 1[8000] via P2P/IPC
 Channel 01/0 : 1[8000] -> 0[5000] via P2P/IPC
 [probe] allreduce 16MB: 3352.2 us/iter, 5.00 GB/s, bad=0
 ```
+
+### 7.6 vLLM venv 修复记录与路线 B 基线（2026-11-08）
+
+`/home/jay/vllm-venv` 是 `pip install --no-deps` 装出来的，缺依赖且平台探测会走错分支。四处修复：
+
+| # | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | `AttributeError: '_OpNamespace' '_C' 没有 cutlass_scaled_mm_supports_block_fp8` | ROCm 插件检测依赖 `amdsmi`，缺失后回落到 `NvmlCudaPlatform`（本机还挂着一张 NVIDIA 卡），于是执行到 CUDA-only 的 cutlass 分支 | 从 ROCm 7.2 的 `amd-smi-lib` deb 中解包出 `amdsmi`（自带 `libamd_smi.so`）放进 venv `site-packages` |
+| 2 | `RuntimeError: Only one platform plugin can be activated: ['cuda','rocm']` | 混合显卡机器上 NVML 与 amdsmi 同时命中 | 在 `vllm/platforms/__init__.py` 的 `cuda_platform_plugin()` 开头加 `if torch.version.hip: return None`（ROCm 构建不该认 CUDA） |
+| 3 | `ModuleNotFoundError: torchvision` | 依赖没装 | 装 `torchvision==0.29.1+rocm7.2`（`--no-deps`，不换 torch） |
+| 4 | `ModuleNotFoundError: model_hosting_container_standards` | API 层依赖没装 | 补装 `model-hosting-container-standards / mcp / opentelemetry-sdk / grpcio` 等 |
+
+另外两个非依赖的启动参数问题：`max_num_seqs=256` 会超过 Mamba cache blocks（95）导致建图失败，降到 16；`VLLM_USE_TRITON_FLASH_ATTN` 在该版本已不是有效变量（告警，无影响）。
+
+路线 B 实测（`--tp-size 2 --disable-custom-all-reduce --max-model-len 32768 --max-num-seqs 16 --gpu-memory-utilization 0.85`，无投机解码，`max_tokens=256`，每级 ×4 轮）：
+
+| 并发 | 总吞吐 (tok/s) | 单请求 (tok/s) | TTFT P50 | 端到端 P50 | GPU 双卡 |
+|---|---|---|---|---|---|
+| 1 | 42.7 | 42.7 | 203 ms | 6.0 s | 98.8% / 98.7% |
+| 2 | 74.5 | 37.3 | 395 ms | 6.9 s | 99.3% / 99.3% |
+| 4 | 131.0 | 32.8 | 673 ms | 7.8 s | 99.6% / 99.6% |
+| 8 | **193.1** | 24.1 | 1220 ms | 10.6 s | 99.4% / 99.5% |
+
+日志铁证：`Using ['PYNCCL'] all-reduce backends`（custom AR 已按路线 B 关掉）、`isAllDirectP2p 1`、8 条通道全部 `via P2P/IPC`。注意这组数字**不能与 §5 的 SGLang 表直接对比**：那张表带 DFlash2 投机解码，这张表是纯 decode 基线。
