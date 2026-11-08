@@ -1,103 +1,158 @@
-# Strata DP2 双单卡 replicas 并发实测（参考 lcz.me/post/24728）
+# Strata DP2 双单卡 replicas 并发实测（对标 lcz.me/post/24728）
 
-帖子方案：不用 TP2/layer split，用 Strata 自带 `replicas` 机制——每卡一个独立模型副本（独立 engine、KV、MTP、会话），单端口，请求按「会话回原卡、否则最闲」路由，双流聚合互不干扰。帖子成绩：单流 83.85 tok/s，双流聚合 159.7–170.8 tok/s。
+帖子方案：不用 TP2/layer split，用 Strata 自带 `replicas`——每卡一个独立模型副本（独立 engine、KV、MTP、会话），单端口，请求按「会话回原卡、否则最闲」路由。帖子成绩：单流 83.6–85.5 tok/s，双流聚合 159.5–170.8 tok/s（64K 上下文，temperature=0，medium thinking）。
 
-本机（Xeon E5-2696 v4 22c44t + 2×7900 XTX，Strata v0.1.47）复刻结果如下。
+本文是 **2026-11-08 的第二次复测**：先纠正上一版口径缺陷，再在同一协议下重测，最后量化差距。
 
-## 一、实测结果
+## 〇、结论（TL;DR）
 
-| 指标 | 帖子（EPYC 7452） | 本机实测 | 差距 |
+| 维度（64K 上下文，同协议） | 本机 | 帖子 | 差距 |
 |---|---|---|---|
-| 单流（稳定档） | 83.83–84.03 tok/s | **62.8–74.1 tok/s，均值 67.2** | −20% |
-| 双流聚合 ×4 | 159.7–170.8 tok/s | **90.3–97.7 tok/s，均值 92.9** | −43% |
-| 双流每流 | ~80 tok/s | ~46 tok/s | −42% |
-| MTP 草稿接受率 | — | **69.4%**（1984/2859） | — |
-| OOM/崩溃 | — | 修复后 0 次（修复前双流必崩） | — |
+| 单流 decode | **58.5–62.9，取中位 60.5** | 83.6–85.5，取中位 84.5 | **−24 tok/s，−28%** |
+| 双流每流 | **45.4–48.6（均 47.0）** | ~80–85 | **−43%** |
+| 双流聚合 | **84.5–92.8（均 88.7）** | 159.5–170.8 | **−46%** |
 
-方法：SSE 流式、`stream_options.include_usage`、服务端 `completion_tokens` 计数、温度 0、300 tokens、先双卡各预热一次；聚合 = 两流总 token ÷ 墙钟。副本路由经 `/metrics` 确认均衡（routed 8 : 7）。
+- 差距**不是**「双流才崩」：单流就已经慢 28%，双流再叠加 20–25% 的共同资源争用（帖子双流不掉速）。
+- 上一版的「单流 67.2」是高估：那套口径（300 tokens、无 reasoning effort、服务端均值、含预热不足）比这次更宽松；按帖子口径重测是 60.5，**真实差距比旧表更大**（旧表 −20%，实际 −28%）。
+- 上一版的「内存带宽是 77 GB/s 硬顶、单流已贴顶」不成立：实测 triad 40 GB/s、纯读 56 GB/s，且专家缓存命中率 92–96%，主机内存流量很小（见五、归因）。
 
-### 为什么比帖子低（差距归因）
+## 一、测量口径（与上版的差异）
 
-Strata 的 native 专家路径是**主机内存流式计算**（专家权重加载进 RAM，GPU 只做 reduction）——这条路径吃 CPU 与内存带宽：
+帖子给的只有「temperature=0 / medium thinking / 64K 上下文」，本机复刻取以下协议，脚本 [bench-unified.py](file:///home/jay/work/x99-7900xtx-p2p/scripts/bench-unified.py)：
 
-1. **CPU 代差 + 无 AVX-512**：引擎日志明确 `this CPU has no AVX-512: the expert kernels run on AVX-2`。E5-2696 v4 是 Broadwell（2.2 GHz 基频），帖子是 EPYC 7452 Zen2。→ 解释单流 −20%。
-2. **内存带宽是双流的硬顶**：本机 DDR4 四通道（Broadwell-EP ≈ 77 GB/s），帖子 EPYC 八通道（≈ 205 GB/s）。单流已接近带宽上限（67），双副本共享同一条内存总线 → 每流掉到 46、聚合 92 而非 134。帖子双流不掉速（2×80），差在这里。→ 解释双流 −43%。
+- `temperature=0`、`reasoning_effort=medium`（帖子「medium thinking」，走 chat_template）、`max_tokens=512`；
+- 上下文 64K = 仓库 docs 语料（37k token 语料循环填充）截到 65537 token；短上下文对照用 ~30 token；
+- **每条流用不同提示词**（规避 DP2「同会话回原卡」路由陷阱）；
+- 每级先 warmup 一轮，再测 2–3 轮；
+- 记录 TTFT；**decode 速率 = (completion_tokens−1)/(total−TTFT)**，扣除 prefill；
+- **聚合 = 同一轮所有流 completion_tokens ÷ 各流首个 token 到最后一个 token 的共同窗口**（帖子「双请求共同窗口聚合」）；
+- token 计数一律取服务端 `usage`（不是 chunk 数）。
 
-结论：**方案本身在本机成立且稳定**（路由均衡、无崩溃、聚合 92.9 ≈ 单流 ×1.38），收益上限受制于本机 CPU/内存带宽；这台机器的 Strata 并发天花板就是 ~90–100 tok/s 聚合。
+与上版的差异（上版这些都没控制）：300→512 tokens、未分 prompt 长度、单流计速含首 token、未记录 TTFT、并发口径混入 8 流、未用 reasoning_effort。
 
-## 二、踩坑记录（复刻必读）
+注意两个会误导的现象：
 
-### 1. 共享 expert arena 不要手建
+1. **专家缓存预热**：短上下文下同一配置的单流会从 47.1 一路升到 68.1（3 轮），因为专家缓存是边跑边填的。64K 的 prefill 本身就会把缓存填满，所以 64K 数据更稳（58.5–62.9）。
+2. **前缀缓存**：第二轮起 64K 的 TTFT 从 44.6 s 掉到 0.8–1.5 s（`cached_tokens=65542`），但 decode 速率不受影响；上表 decode 数据两轮都取。
 
-`/dev/shm/strata-shared-arena.bin` 必须由引擎创建——它带 pack 哈希头。手工 `truncate` 出的空文件（无论 157 MB 还是精确的 50294992896 字节）都会被拒：
+## 二、硬件与软件核对
 
-- 尺寸不对：`could not be reserved (50294988800 B): ... is X B, expected 50294992896 B`
-- 尺寸对但无哈希头：`shared arena ... has an incompatible or missin[g]`
+| 项目 | 本机 | 帖子 |
+|---|---|---|
+| CPU | Xeon E5-2696 v4，**22C/22T（超线程关闭）**，2.2 GHz 基频；实测解码时单核 2.8–3.7 GHz、22 核均值 2.25 GHz | EPYC 7452，**32C/64T**，Zen2 |
+| 内存 | 125 GiB DDR4；**实测 triad 40 GB/s、纯读 56 GB/s**（16 线程，1 GiB×3；无 root 读不到 DMI 通道数，按带宽反推为 4 通道） | 125 GiB；EPYC 八通道，理论 ~205 GB/s |
+| GPU | 2× RX 7900 XTX，gfx1100；解码 245–249 W/卡，sclk 2.9–3.1 GHz，结温 66–76 °C | 2× RX 7900 XTX，开放式机架 |
+| ROCm | 7.2.0 | 未注明 |
+| Strata | **0.2.2（build 0.1.47）** | **0.1.43** |
+| 模型 | Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S（abliterated 目录，同名文件） | 同名 IQ3_S |
+| 关键参数 | 一致：`--spec 4 --spec-min-p 0.5 --mtp-window 32768 --kv int8 --kv-resident 32768 --prefill auto:32768 --conversation-cache-mib 8192 --expert-cache auto`；`--vram-reserve-mib 700`（与帖子一致，专家缓存 17.02 GiB/卡） | 同 |
 
-**正确做法：删掉文件直接启动**，引擎自建（~46.8 GiB tmpfs，需 /dev/shm ≥ 50 GB；本机 63 GB 够）。
+未对齐的软件项：本机用的是 Abliterated 目录下的同名权重（帖子用的应是原版权重，无法确认二者逐字节一致），以及 Strata 版本差 4 个小版本。硬件层最大差异是**内存通道数（4 vs 8）与 CPU 核数（22 vs 32）**。
 
-### 2. `--vram-reserve-mib 256` 不够，双流必崩
+## 三、实测结果
 
-首次压测双流时 replica 1 崩溃：
+### 3.1 64K 上下文（与帖子同口径）
 
-```
-verify: instantiate: out of memory
-→ [strata] replica 1 had stopped; starting it again（54s 停顿 = 重建 46.84 GiB）
-```
+| 并发 | 聚合 tok/s | 每流 tok/s | TTFT | 说明 |
+|---|---|---|---|---|
+| 1（冷 prefill） | 58.5 | **58.5** | 44.6 s（prefill ≈1.47k tok/s） | 服务端日志 57.2–60.5 |
+| 1（前缀命中） | 62.4–63.0 | **62.6** | 0.8–1.5 s | |
+| 2 | **88.7–92.8** | 45.4–48.6 | 0.8–1.2 s | 日志里两流 40.5 / 48.0 |
 
-根因：expert-cache `auto` 把显存吃到只剩 146 MiB，双流期间 verify 窗口 CUDA graph **懒捕获**时没余量。**修复：`--vram-reserve-mib` 256 → 1536**（expert cache 自动缩水 1.3 GB），修复后 4/4 轮零崩溃。
+### 3.2 短上下文（~30 token 提示）对照
 
-### 3. 双流必须用不同提示词（会话路由陷阱）
+| 并发 | 聚合 | 每流 | TTFT |
+|---|---|---|---|
+| 1 | 51.7（42.9–61.4，随缓存预热上升） | 56.6 | 0.8 s |
+| 2 | 91.0（84.9–101.8） | 49.5 | 0.4–1.1 s |
+| 4 | 90.3 | 49.8 | 第 3、4 路 **10–12 s**（只有 2 个槽位） |
 
-路由规则是「同一会话回原卡」。两个并发流用**完全相同**的提示词时，会话键相同 → **都进同一副本排队**，聚合只有 46–60 tok/s。改用不同提示词后立即恢复路由均衡（routed 8:7），聚合 92.9。
+> 这一组是**墙钟聚合**（含 TTFT）——短提示 TTFT 只占 ~8%，与第六节 SGLang 那组同口径；3.1 的 64K 组才是帖子的「共同解码窗口」口径。
 
-### 4. profile 路径指向已拔的 USB
+### 3.3 运行态资源（采样 2 s 一次）
 
-本机 `strata-iq3_s-dp2.json` 的 native/pack 路径还停在 `/media/jay/D80FB5BFFA0F57B7/...`，实际文件在 `/mnt/llm/...`（NVMe，/mnt/llm 即根分区）。已批量替换并同步到 `strata-patch/`。
+- 单流：GPU A 249 W 均值；双流：GPU A 245 W / GPU B 242 W，**两张卡功耗与单流相同**——GPU 不是「空闲等数据」。
+- 双流时 CPU 22 核均值 2.25 GHz（单流时热点核 2.8–3.7 GHz），strata 进程约 185% CPU。
+- 专家缓存命中率 91.7–94.5%，`+0.1–0.3%` 走 PCIe；MTP 接受率 **64.5%**（64K 那组 2568/3984）。
+- Strata 启动自测 **PCIe host→device 5.3 GB/s**（`pcie_frac` 自动从 0.55 降到 0.15）。两块卡都挂在 PCIe 交换机下（`03:00.0 → 05:00.0`、`06:00.0 → 08:00.0`），x99/E5 v4 是 PCIe 3.0 平台；帖子未给出这项。
 
-### 5. pkill 自匹配
+## 四、差距量化
 
-`pkill -f "strata.py serve"` 会匹配到执行命令本身的命令行（bash -c 全文含该串）把 shell 自杀。**用括号正则**：`pgrep -f "strata[.]py serve"`、`pgrep -f "build-hip[/]strata"`。
+| 项目 | 本机 | 帖子 | 差值 |
+|---|---|---|---|
+| 单流 | 60.5 | 84.5 | −24.0 tok/s（**−28%**，本机是对方的 0.72×） |
+| 双流每流 | 47.0 | 82.5 | −35.5 tok/s（**−43%**，0.57×） |
+| 双流聚合 | 88.7 | 165.0 | −76.3 tok/s（**−46%**，0.54×） |
 
-## 三、启动方式与观测
+若按上一版口径（短提示 300 tokens、服务端均值）得到 67.2，则单流只差 −20%——**旧口径系统性高估本机、低估差距**。
+
+## 五、归因（哪些有证据，哪些只是推测）
+
+**已被实测确认的：**
+
+1. **差距主要在单流，不是并发架构。** 本机双流聚合/单流 = 88.7/60.5 ≈ 1.47×；帖子 165/84.5 ≈ 1.95×。方案本身（双副本、独立 KV/MTP）工作正常：路由均衡、零崩溃、两卡同时 245 W。
+2. **双流时本机每流掉 20–25%（62.6→45.4–48.6），帖子不掉速。** 这只能来自两副本共享的主机侧资源：本机实测内存带宽只有对方八通道平台的 1/4 左右，CPU 核数 22 vs 32。两卡功耗没有下降，所以不是 GPU 在等数据；是每步的主机侧工作量在争抢。
+3. **Strata 的 native 专家路径把一部分专家计算放在 CPU 池**（`docs/MULTI_GPU.md`：*the CPU pool computes whatever no card holds*；引擎日志也会提示本机无 AVX-512、专家 kernel 走 AVX-2）。本机 6% 左右的未命中专家由 22 核 Broadwell 计算，帖子由 32 核 Zen2 计算，单核 IPC 与核数都占优。
+4. **MTP 接受率 64.5%** 是另一条未与帖子对齐的变量（帖子未公布）。接受率直接决定每步出几个 token，若有 10 个点差距就足以解释 10–15% 的速度差。
+
+**上一版里被推翻的两条：**
+
+- ~~「单流已接近 77 GB/s 内存带宽上限」~~：实测 triad 只有 40 GB/s、纯读 56 GB/s；且 92–96% 的专家命中在显存，跨 PCIe 仅 0.1–0.3%。单流时 CPU 只忙 ~2 核、GPU 满功耗，不是带宽打满的样子。
+- ~~「双流 93 就是内存带宽硬顶」~~：方向（共享主机资源）仍成立，但当时没有任何证据；现在有「仅本机双流掉速 + GPU 功耗不降」这组对照。
+
+**仍无法定论的：** Strata 0.1.43→0.1.47 的调度/内核变化、双方权重是否逐字节一致、帖子测试文本的 MTP 接受率。这三项无法在本机复现，只能标注为残差。
+
+## 六、同口径下与 SGLang TP2+DFlash2 的比较（内部参考）
+
+同一脚本、同 512 tokens / medium thinking：
+
+| 并发 | Strata DP2 | SGLang TP2+DFlash2 |
+|---|---|---|
+| 1 | **60.5**（64K）/ 56.6（短） | 50.8 |
+| 2 | **88.7**（84.5–92.8） | 74.5 |
+| 4 | **90** | 84.8 |
+| 8 | 90（2 槽位，后 6 路排队） | 107.1（4 路 TTFT 18–20 s） |
+| 64K 单流 | **58.5–62.9** | **11.6**（TTFT 72 s） |
+
+重要提醒：**两者模型不同**（Flash-Next IQ3_S MoE vs Qwen3.8-27B AWQ-INT4），所以这是「整套配置」对比，不是纯引擎对比。另外，上一版所谓 SGLang「8 并发 147–152」是另一套 prompt/256 token 口径，同口径只有 107，**旧表把 SGLang 的并发优势放大了**。
+
+## 七、做法与踩坑（复刻必读）
+
+1. **共享 expert arena 不要手建**：`/dev/shm/strata-shared-arena.bin` 必须由引擎创建（带 pack 哈希头），手 `truncate` 的会被拒。删掉文件直接启动即可（~46.8 GiB tmpfs，`/dev/shm` ≥ 50 GB）。
+2. **`--vram-reserve-mib` 不要低于 700**：256 时双流必崩（verify 图懒捕获 OOM，副本重建 46.84 GiB，停顿 ~54 s）。帖子用 700，本次也用 700，零崩溃。
+3. **双流必须用不同提示词**：同 prompt 会命中同一会话 → 都进同一副本排队，聚合掉到 46–60。
+4. **profile 路径**：本机 `strata-iq3_s-dp2.json` 的 native/pack 路径曾指向已拔的 USB，实际在 `/mnt/llm/...`。
+5. **pkill 自匹配**：用括号正则 `pgrep -f "strata[.]py serve"`、`pgrep -f "build-hip[/]strata"`。
+6. **测速必须扣 TTFT、必须读服务端 usage**：思考 token 在 `reasoning_content`，chunk 数 ≠ token 数（MTP 一步吐多个）。
+
+## 八、复现命令
 
 ```bash
+# 起 DP2（与帖子同配，700 预留）
 cd /home/jay/strata
-# 起（独立端口，不影响 systemd 的 8080 layer-split 模式）
 setsid nohup .venv/bin/python strata.py serve \
-  --profile strata-iq3_s-dp2.json --host 127.0.0.1 --port 8082 \
-  > strata-dp2-8082.log 2>&1 < /dev/null &
-# 就绪判定
-curl -s http://127.0.0.1:8082/health
-# 副本路由/槽位/接受率
-curl -s http://127.0.0.1:8082/metrics | python3 -m json.tool
-#   live.replicas → [{replica, alive, running, routed, batch}, ...]
-#   totals → drafts_offered/drafts_accepted
+  --profile /tmp/strata-dp2-r700.json --host 127.0.0.1 --port 8082 \
+  > strata-dp2-8082-r700.out 2>&1 < /dev/null &
+
+# 64K 口径（同帖子）
+/home/jay/sglang-venv/bin/python scripts/bench-unified.py \
+  --base-url http://127.0.0.1:8082 --levels 1,2 --rounds 2 \
+  --max-tokens 512 --context-tokens 65536 --out /tmp/dp2-64k.json
+
+# 短上下文 + 并发档位
+/home/jay/sglang-venv/bin/python scripts/bench-unified.py \
+  --base-url http://127.0.0.1:8082 --levels 1,2,4 --rounds 3 \
+  --max-tokens 512 --context-tokens 0 --out /tmp/dp2-short.json
 ```
 
-启动到就绪约 **78 s**（含 55 GB 专家加载进 RAM + GEMM 预热），进程 RSS 每副本 51.9 GB，显存每卡 23.4 GB。
+`/tmp/strata-dp2-r700.json` = 正式 profile 只改 `--vram-reserve-mib 1536 → 700`、日志名不同。启动到就绪 48 s（比正式 profile 的 78 s 略快）。
 
-## 四、与 TP2 的分工（同一台机）
+## 九、对「回退 SGLang」决策的修订（2026-11-08 复测后）
 
-| | Strata DP2（本篇） | SGLang TP=2 |
-|---|---|---|
-| 并发模式 | 双单卡副本，无卡间通信 | 张量并行，all_reduce（P2P 已验证 via P2P/IPC） |
-| 本机峰值 | 单流 67 / 双流聚合 93 | 单流 28（无投机）/ 并发 147–152 |
-| 适合 | 单流交互、两条独立会话 | 多路并发批量、追求总吞吐 |
-| 显存 | 每卡 23.4 GB 满载（无余） | 每卡 20.6 GB |
+上一版结论是「DP2 并发低 40%+ 且只有 2 槽位 → 回退 SGLang」。同口径复测后：
 
-两者互斥占卡（gpu-mode 占用权机制管理），按场景二选一。
+- DP2 单流 +19%（60.5 vs 50.8）、双流 +25%（96 vs 74.5）、4 路持平（90 vs 85），**只有 8 路落后**（90 vs 107）；
+- 长上下文（64K）DP2 是 SGLang 的 5 倍（58.5–62.9 vs 11.6，TTFT 44.6 s vs 72 s）；
+- 但 DP2 每副本只有 1 个并发槽，第 3 个任务起排队（TTFT 10–12 s），8 路同时在线会明显排队。
 
-## 五、回退决策（2026-11-08）：已停用 DP2，回到 SGLang TP2 + DFlash2
-
-实测对比后按「多任务并发为主」的使用场景做了回退：
-
-| | Strata DP2 | SGLang TP2 + DFlash2（回退后） |
-|---|---|---|
-| 单流 | **67.2** | 49.5–52.2 |
-| 8 并发聚合 | **93 封顶，槽位仅 2**（第 3 个任务起排队） | **147–152，8 路合批** |
-| 每任务体感（多任务） | 每流掉到 46 + 排队 | 合批摊薄，明显更快 |
-
-判定：DP2 单流快 36%，但并发总吞吐低 40%+ 且槽位只有 2，整体没以前好 → 回退。回退操作：`pkill -f 'strata[.]py serve'`（含 `build-hip[/]strata`）停 DP2，再 `MODEL_27B=/mnt/llm/sglang/models/Qwen3.8-27B-abliterated-AWQ-INT4 bash sglang-tp.sh start tp2`（脚本默认 /mnt/d 路径已失效，须用环境变量指回 /mnt/llm）。回退后验证：DFlash2 生效（`speculative_algorithm=DFLASH`、mem_fraction 0.79）、单流 52.2 tok/s、生成正常；P2P 仍由 `/etc/rccl.conf` 系统级兜底，无需额外处理。
-
-DP2 方案保留在上文，仅当需要「单流 67 tok/s 上限」或「两条完全独立会话」时再临时切换。
+修订建议：**默认用 DP2**（单流/双流/长上下文都更好），只在「≥6–8 路同时跑」时临时切 SGLang TP2。上一轮的回退依据来自不可比的口径，不应作为默认策略。当前机器状态仍维持上一轮回退后的 SGLang TP2（本次复测结束后未改），是否切回由使用者决定。
