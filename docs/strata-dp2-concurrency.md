@@ -87,3 +87,17 @@ curl -s http://127.0.0.1:8082/metrics | python3 -m json.tool
 | 显存 | 每卡 23.4 GB 满载（无余） | 每卡 20.6 GB |
 
 两者互斥占卡（gpu-mode 占用权机制管理），按场景二选一。
+
+## 五、回退决策（2026-11-08）：已停用 DP2，回到 SGLang TP2 + DFlash2
+
+实测对比后按「多任务并发为主」的使用场景做了回退：
+
+| | Strata DP2 | SGLang TP2 + DFlash2（回退后） |
+|---|---|---|
+| 单流 | **67.2** | 49.5–52.2 |
+| 8 并发聚合 | **93 封顶，槽位仅 2**（第 3 个任务起排队） | **147–152，8 路合批** |
+| 每任务体感（多任务） | 每流掉到 46 + 排队 | 合批摊薄，明显更快 |
+
+判定：DP2 单流快 36%，但并发总吞吐低 40%+ 且槽位只有 2，整体没以前好 → 回退。回退操作：`pkill -f 'strata[.]py serve'`（含 `build-hip[/]strata`）停 DP2，再 `MODEL_27B=/mnt/llm/sglang/models/Qwen3.8-27B-abliterated-AWQ-INT4 bash sglang-tp.sh start tp2`（脚本默认 /mnt/d 路径已失效，须用环境变量指回 /mnt/llm）。回退后验证：DFlash2 生效（`speculative_algorithm=DFLASH`、mem_fraction 0.79）、单流 52.2 tok/s、生成正常；P2P 仍由 `/etc/rccl.conf` 系统级兜底，无需额外处理。
+
+DP2 方案保留在上文，仅当需要「单流 67 tok/s 上限」或「两条完全独立会话」时再临时切换。
