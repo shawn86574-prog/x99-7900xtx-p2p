@@ -302,8 +302,10 @@ commands handy, and do not deploy it where silent data corruption is unacceptabl
   (Chinese).
 - [`docs/engine-p2p-matrix.md`](docs/engine-p2p-matrix.md) — which engines actually get P2P
   (ComfyUI / vLLM / SGLang / Strata), why a vLLM TP=2 instance runs but still falls back to
-  SHM (worker processes carry `NCCL_*=0`), and the `/etc/rccl.conf` fix that survives
-  environment rebuilding (Chinese).
+  SHM (worker processes carry `NCCL_*=0`), the `/etc/rccl.conf` fix that survives
+  environment rebuilding, and a per-post TP2 stack audit (lcz #2525 / #2599 / #2132 /
+  #24728): which collectives need real P2P, which are auto-disabled on gfx1100, and the
+  settings each shape needs (Chinese).
 - [`docs/tp2-default-policy.md`](docs/tp2-default-policy.md) — default-on **TP=2 + P2P**
   policy: single-card launch entries pop a notice and silently redirect to the dual-instance
   launcher; `TP_ALLOW_SINGLE=1` is the explicit single-GPU override

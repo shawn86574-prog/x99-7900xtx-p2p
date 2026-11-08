@@ -284,3 +284,65 @@ grep -rn "NCCL_P2P_DISABLE=1" ~/.bashrc /etc/profile.d/ /path/to/launcher/*.sh
 
 - vLLM 侧"哪一行代码重建了 env"未定位到具体行号——只坐实了**结果**（进程 env 无 `NCCL_TOPO_FILE`）与**排除项**（不是 Python spawn 的通用行为）。修复方案不依赖这个定位；
 - `/etc/rccl.conf` 生效前后的 **allreduce 带宽数字对比**（本次只拿到 `via P2P/IPC` 的通道证据，没跑吞吐基准）。
+
+## 七、从 SGLang / vLLM 的 TP2 通信栈反推：本机补丁能不能承载这些帖子
+
+> 2026-11-08。样本：vLLM **0.32.0**（`/home/jay/vllm-venv`）、SGLang gfx1100 fork（`/home/jay/sglang-gfx1100`，editable 安装），两者均为 torch `2.13.0+rocm7.2` / RCCL `2.27.7`；内核已升到 `7.0.0-42-generic`，DKMS `p2p-force/1.0` 已随内核重建。
+
+### 7.1 TP2 不是一条路，而是四条
+
+两个框架的 TP2 都按「小张量走 IPC 自定义 allreduce、大张量走 RCCL」分层，但启用条件不同。逐条查源码后，本机实际只有**第一条**在跑：
+
+| # | 通信路径 | 谁在用 | 是否需要真 P2P | 本机事实（代码依据） |
+|---|---|---|---|---|
+| 1 | **RCCL ring/tree allreduce** | vLLM、SGLang 的兜底，也是当前实测主路径 | 需要；没有就走 SHM（主机内存中转） | `/etc/rccl.conf` 提供拓扑；实测 `via P2P/IPC` ×4、16 MB allreduce **5.00 GB/s** |
+| 2 | vLLM CustomAllreduce（HIP IPC） | vLLM TP=2 **默认启用** | 需要（IPC peer 映射） | `_ENABLE_CUSTOM_ALL_REDUCE=True`；本机 `meta_size()` 可用 → `custom_ar=True`；ROCm 分支**跳过** P2P 探测（`custom_all_reduce.py` §281-291，注释写「AMD 上 XGMI 之间 P2P 恒开」） |
+| 3 | vLLM QuickAllReduce | 仅 MI300 | 不适用 | `_rocm_arch_available()` 只认 `gfx94/gfx95` → gfx1100 自动 disabled |
+| 4 | AITER Custom AR | 需显式 `VLLM_ROCM_USE_AITER_CUSTOM_AR` + AITER 支持 | 不适用 | 本机未启用 |
+| 5 | SGLang CustomAllreduce | 默认走 NVLink/amdsmi 探测；`SGLANG_RDNA_CUSTOM_AR=1` 才是 fork 的 PCIe IPC 版 | 需要 | 本机 amdsmi 不可用 → 默认 disabled；启动器显式 `--disable-custom-all-reduce`；`custom_all_reduce.py` §99-111 |
+| 6 | SGLang QuickAllReduce | 仅 gfx94/gfx95 | 不适用 | `qr_rocm_arch_available()` → gfx1100 disabled |
+| 7 | Strata peer 直拷 | Strata 双卡层切分 | 直接依赖内核 peer access | 不走 RCCL，自带 memcmp 自检（见 §3.2） |
+
+反推的关键结论只有一句：**两个框架的 TP2 都把「AMD 卡之间必有 P2P」当公理**——vLLM 连检查都不做，SGLang 的默认路径直接把 custom AR 关掉。本机是 PCIe 而非 XGMI，所以这条公理要么由内核补丁兜住，要么就必须显式绕开。
+
+### 7.2 逐帖判定
+
+| 帖子 | 方案形态 | 本机能否执行 | 与本补丁的关系 | 特别设置 |
+|---|---|---|---|---|
+| [#2525](https://lcz.me/topic/2525) TP2 的坑（PCH） | RCCL TP2 | ✅ 能。该帖的 401 故障链在本机不成立（双卡不在 PCH 下、根端口 AtomicOps 全 +、交换芯片 Routing+，见 `report.md` §2.1） | **无关**。补丁只去掉 p2pdma 白名单这道软件门，修不了 PCH 的 AtomicOp 缺失——别把 X99 补丁当 PCH 平台的解药 | `/etc/rccl.conf` 必须在；启动环境不得有 `NCCL_P2P_DISABLE=1`；用 `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT` 确认 `via P2P/IPC` 而非 `via SHM` |
+| [#2599](https://lcz.me/topic/2599) 双 R9700 / Arrow Lake P2P | 内核强开 p2pdma + 伪造 PXB 拓扑 | ✅ 能，本仓库即该方案的 X99 移植；2026-11-08 在 `7.0.0-42` 复测通过：`canAccessPeer` 双向 True、`isAllDirectP2p 1`、`via P2P/IPC` ×4、5.00 GB/s、`bad=0` | 同源 | BIOS 四项（VT-d / Above4G / ReBAR / ACS off）+ Secure Boot off；**每次内核升级后确认 DKMS 已重建**；拓扑 BDF 必须与实机一致（`gen-topo.sh`）。帖子是 Gen5 平台，本机 Gen3 x8（理论 7.88 GB/s），5.0 GB/s 已接近本机上限，**不能拿帖子的带宽当验收线** |
+| [#2132](https://lcz.me/topic/2132) gfx1100 SGLang 魔改 | `--tp-size 2` + 该 fork 的 RDNA kernel | ✅ 能；补丁与 fork 不冲突 | 兼容，但要选对 custom AR 开关（见 7.1 第 5 行） | `--disable-custom-all-reduce`（启动器已带）；`--attention-backend triton`；`--mem-fraction-static 0.79`（DFlash2 要留 4 GB 给 BF16 draft）。想启用 fork 的 `SGLANG_RDNA_CUSTOM_AR=1` 时，必须同时满足：内核 peer access on、双卡可见拓扑、每进程只绑一张卡——缺一即 peer 读到 0 或建图报错；当前该扩展未安装，保持关闭 |
+| [#24728](https://lcz.me/post/24728) Strata DP2 双单卡 replicas | 两个独立单卡实例 | ✅ 能，但**不用 TP2、不走 RCCL** | **无关**：P2P 既不加速也不阻碍 | 无。不要为它把 `/etc/rccl.conf` 换成单卡拓扑——单卡进程不涉及 peer 判定，conf 对它是空操作 |
+
+### 7.3 vLLM TP2 的两条路线（唯一需要做选择的地方）
+
+| 路线 | 启动参数 | 依赖 | 验收口径 |
+|---|---|---|---|
+| A · 保留 custom AR（默认） | 不加 `--disable-custom-all-reduce` | **强依赖内核补丁**：ROCm 分支跳过 P2P 探测，IPC peer 映射失败时不会优雅回退 | 启动无 IPC 报错；双卡利用率对齐（差 ≤ 0.1 个百分点）；同 prompt 输出一致；`via P2P/IPC` 仍出现 |
+| B · 收敛到 RCCL（保守） | `--disable-custom-all-reduce` | 只依赖 `/etc/rccl.conf` + 内核补丁 | 与 SGLang 当前配置同口径，已有完整的 1/2/4/8 并发数据（§5） |
+
+**建议**：先按 B 跑（可复现、有基线），确认 `via P2P/IPC` 后再试 A；A 的收益只在小张量 allreduce，风险是 peer 映射失败时没有探测兜底。
+
+### 7.4 会静默失效的三件事
+
+1. **`NCCL_P2P_DISABLE=1` 残留**（shell / systemd / 启动器）——环境变量优先于 `/etc/rccl.conf`，P2P 直接关掉；
+2. **拓扑形状错**——单进程双卡可见（vLLM/SGLang）用 `topo-pxb.xml`，每进程单卡可见（ComfyUI）用 `topo-pxb-single.xml`，混用报 `Ring 0: Asymmetric link!`；
+3. **内核升级后 DKMS 没重建**——`canAccessPeer` 变 False，但引擎照常启动（回落 SHM），只有对比日志/带宽才发现变慢。
+
+### 7.5 复现（本次实测，`7.0.0-42-generic`）
+
+```bash
+lsmod | grep p2p_force
+TORCHRUN=/home/jay/sglang-venv/bin/torchrun bash scripts/p2p-preflight.sh
+```
+
+输出要点：
+
+```
+[OK]   RCCL 已走 P2P/IPC
+[probe] canAccessPeer 0->1=True 1->0=True
+Check P2P Type isAllDirectP2p 1 directMode 0
+Channel 00/0 : 0[5000] -> 1[8000] via P2P/IPC
+Channel 01/0 : 1[8000] -> 0[5000] via P2P/IPC
+[probe] allreduce 16MB: 3352.2 us/iter, 5.00 GB/s, bad=0
+```
